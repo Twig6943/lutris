@@ -1,11 +1,17 @@
 from unittest import TestCase
+from unittest.mock import Mock, patch
+
+from gi.repository import Gtk
 
 from lutris import runners
+from lutris.database import games as games_db
 from lutris.gui.application import LutrisApplication
 from lutris.gui.config.add_game_dialog import AddGameDialog
 from lutris.gui.config.game_info_box import GameInfoBox
+from lutris.gui.dialogs.run_exe import RunExeDialog
 from lutris.gui.views.store import sort_func
 from lutris.util.test_config import setup_test_environment
+from tests._test_pga import DatabaseTester
 
 setup_test_environment()
 
@@ -42,6 +48,37 @@ class TestGameDialog(TestCase):
 
     def test_dialog(self):
         self.assertEqual(self.dlg.notebook.get_current_page(), 0)
+
+
+class TestRunExeDialog(DatabaseTester):
+    def test_only_installed_wine_games_are_selectable(self):
+        wine_id = games_db.add_game(name="Wine game", runner="wine", installed=1, configpath="wine-game")
+        games_db.add_game(name="Native game", runner="linux", installed=1, configpath="native-game")
+        games_db.add_game(name="Uninstalled game", runner="wine", installed=0, configpath="uninstalled-game")
+        games_db.add_game(name="Missing configuration", runner="wine", installed=1)
+        dialog = RunExeDialog("/tmp/setup.exe")
+        self.addCleanup(dialog.destroy)
+        self.assertEqual([row[0] for row in dialog.games.get_model()], [wine_id])
+        dialog.games.get_selection().unselect_all()
+        self.assertFalse(dialog.run_button.get_sensitive())
+        dialog.games.get_selection().select_path(0)
+        self.assertTrue(dialog.run_button.get_sensitive())
+        application = Mock()
+        with patch.object(dialog, "get_application", return_value=application):
+            dialog.response(Gtk.ResponseType.OK)
+            application.run_executable.assert_called_once_with(wine_id, "/tmp/setup.exe")
+            self.assertFalse(dialog.get_visible())
+
+    def test_cancel_does_not_launch(self):
+        games_db.add_game(name="Wine game", runner="wine", installed=1, configpath="wine-game")
+        dialog = RunExeDialog("/tmp/setup.exe")
+        self.addCleanup(dialog.destroy)
+        dialog.games.get_selection().select_path(0)
+        self.assertTrue(dialog.run_button.get_sensitive())
+        application = Mock()
+        with patch.object(dialog, "get_application", return_value=application):
+            dialog.response(Gtk.ResponseType.CANCEL)
+            application.run_executable.assert_not_called()
 
 
 class TestSort(TestCase):

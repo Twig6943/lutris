@@ -722,6 +722,14 @@ class wine(Runner):
             logger.error("The game doesn't have an executable")
             return None
         exe = os.path.expanduser(exe)  # just in case!
+        if isinstance(exe, str):
+            if "://" in exe:
+                if not exe.lower().endswith((".exe", ".msi", ".bat", ".cmd", ".reg")):
+                    return exe
+            elif ":" in exe and not os.path.isabs(exe) and not exe.lower().startswith(("c:", "z:", "a:", "\\")) and not exe.lower().endswith((".exe", ".msi", ".bat", ".cmd", ".reg")):
+                scheme = exe.split(":", 1)[0]
+                if scheme and scheme.replace("-", "").replace("+", "").replace(".", "").isalnum() and len(scheme) > 1:
+                    return exe
         if os.path.isabs(exe):
             return system.fix_path_case(exe)
         if not self.game_path:
@@ -990,26 +998,27 @@ class wine(Runner):
             blocking=blocking,
         )
 
-    def _run_executable(self, executable):
+    def _run_executable(self, executable, working_dir=None):
         """Runs a Windows executable using this game's configuration"""
-        wineexec(
+        return wineexec(
             executable,
             wine_path=self.get_executable(),
             prefix=self.prefix_path,
-            working_dir=self.prefix_path,
+            working_dir=working_dir or self.prefix_path,
             config=self,
             env=self.get_env(os_env=True),
             runner=self,
         )
 
-    def run_wineexec(self, *args):
-        """Ask the user for an arbitrary exe file to run in the game's prefix"""
-        dlg = FileDialog(_("Select an EXE or MSI file"), default_path=self.game_path)
-        filename = dlg.filename
+    def run_wineexec(self, *args, filename=None):
+        """Run a Windows file in the game's prefix, asking for a file if none was supplied."""
+        if filename is None:
+            dlg = FileDialog(_("Select an EXE, MSI, BAT or REG file"), default_path=self.game_path)
+            filename = dlg.filename
         if not filename:
             return
         self.prelaunch()
-        self._run_executable(filename)
+        return self._run_executable(filename, working_dir=os.path.dirname(filename))
 
     def run_wineconsole(self, *args):
         """Runs wineconsole inside wine prefix."""
@@ -1437,6 +1446,33 @@ class wine(Runner):
         if using_dxvk:
             # Set this to 1 to enable access to more RAM for 32-bit applications
             launch_info["env"]["WINE_LARGE_ADDRESS_AWARE"] = "1"
+
+        # Handle URI schemes (e.g., wine://, ms-windows-store://)
+        if game_exe and isinstance(game_exe, str):
+            is_uri = False
+            if "://" in game_exe:
+                is_uri = not game_exe.lower().endswith((".exe", ".msi", ".bat", ".cmd", ".reg")) or not os.path.exists(game_exe)
+                if game_exe.lower().endswith((".exe", ".msi", ".bat", ".cmd", ".reg")) and os.path.exists(game_exe):
+                    is_uri = False
+                else:
+                    is_uri = True
+            elif ":" in game_exe and not os.path.isabs(game_exe) and not game_exe.lower().startswith(("c:", "z:", "a:", "\\")) and not game_exe.lower().endswith((".exe", ".msi", ".bat", ".cmd", ".reg")):
+                scheme = game_exe.split(":", 1)[0]
+                if scheme and scheme.replace("-", "").replace("+", "").replace(".", "").isalnum() and len(scheme) > 1:
+                    is_uri = True
+            if is_uri and not os.path.exists(game_exe):
+                command = self.get_command()
+                exe_path = self.get_executable()
+                if proton.is_proton_path(exe_path) or proton.is_umu_path(exe_path):
+                    launch_info["env"]["UMU_CONTAINER_NSENTER"] = "1"
+                    command.append("start")
+                    command.append("/wait")
+                    command.append(str(game_exe))
+                else:
+                    command.append("start")
+                    command.append(str(game_exe))
+                launch_info["command"] = command
+                return launch_info
 
         if not game_exe or not system.path_exists(game_exe):
             raise MissingGameExecutableError(filename=game_exe)

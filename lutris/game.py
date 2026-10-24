@@ -802,7 +802,7 @@ class Game:
         return True
 
     @watch_game_errors(game_stop_result=False)
-    def launch(self, launch_ui_delegate: "LaunchUIDelegate") -> bool:
+    def launch(self, launch_ui_delegate: "LaunchUIDelegate", game_config: dict | None = None) -> bool:
         """Request launching a game. The game may not be installed yet."""
         if not self.check_launchable():
             logger.error("Game is not launchable")
@@ -814,6 +814,14 @@ class Game:
         @watch_game_errors(game_stop_result=False, game=self)
         def proceed() -> None:
             self.reload_config()  # Reload the config before launching it.
+
+            if game_config:
+                if self.config:
+                    self.config.game_config.update(game_config)
+                else:
+                    from lutris.config import LutrisConfig  # noqa: PLC0415
+
+                    self.config = LutrisConfig(game_config=game_config)
 
             if self.id in LOG_BUFFERS:  # Reset game logs on each launch
                 log_buffer = LOG_BUFFERS[self.id]

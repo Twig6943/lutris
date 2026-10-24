@@ -24,9 +24,11 @@ import sys
 import tempfile
 import types
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime, timedelta
 from gettext import gettext as _
 from typing import TYPE_CHECKING, Any, Type, TypeVar, cast
+from urllib.parse import unquote
 
 from gi.repository import Gio, GLib, Gtk
 
@@ -39,12 +41,14 @@ from lutris.game import GAME_START, GAME_STOPPED, Game, export_game, import_game
 from lutris.gui.dialogs import ErrorDialog, InstallOrPlayDialog, NoticeDialog, display_error
 from lutris.gui.dialogs.delegates import CommandLineUIDelegate, InstallUIDelegate, LaunchUIDelegate
 from lutris.gui.dialogs.issue import IssueReportWindow
+from lutris.gui.dialogs.run_exe import RunExeDialog
 from lutris.gui.download_queue import DOWNLOAD_QUEUE_COMPLETED
 from lutris.gui.installerwindow import INSTALLATION_COMPLETED, INSTALLATION_FAILED, InstallerWindow
 from lutris.gui.widgets.status_icon import LutrisStatusIcon
 from lutris.installer import InstallationKind, get_installers
 from lutris.migrations import migrate
-from lutris.monitored_command import exec_command
+from lutris.monitored_command import MonitoredCommand, exec_command
+from lutris.runner_interpreter import get_launch_parameters
 from lutris.runners import InvalidRunnerError, RunnerInstallationError, get_runner_names, import_runner
 from lutris.services import get_enabled_services
 from lutris.startup import init_lutris, run_all_checks
@@ -66,6 +70,7 @@ if TYPE_CHECKING:
     from lutris.api import InstallerInfoDict
     from lutris.database.games import DbGameDict
     from lutris.database.services import DBServiceGame
+    from lutris.runners.wine import wine
     from lutris.services.base import BaseService
 
     GtkWindowType = TypeVar("GtkWindowType", bound=Gtk.Window)
@@ -75,7 +80,7 @@ class LutrisApplication(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(
             application_id="net.lutris.Lutris",
-            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE | Gio.ApplicationFlags.HANDLES_OPEN,
             register_session=True,
         )
 
@@ -494,6 +499,40 @@ class LutrisApplication(Gtk.Application):
         else:
             dest_dir = None
 
+        # Handle file/URI arguments passed via command line
+        if argc > 0:
+            args = sys.argv[1:]
+            if len(args) > 1:
+                if self._is_uri(args[0]):
+                    reconstructed = args[0]
+                    start = 1
+                    for arg in args[start:]:
+                        if isinstance(arg, str):
+                            if arg.startswith("-"):
+                                break
+                            reconstructed += "&" + arg
+                            continue
+                        break
+                    if reconstructed != " ".join(args):
+                        self._open_uri(reconstructed)
+                        return 0
+            for arg in args:
+                if arg.startswith("-"):
+                    continue
+                if self._is_uri(arg):
+                    self._open_uri(arg)
+                    return 0
+                elif os.path.isfile(arg):
+                    ext = os.path.splitext(arg)[1].lower()
+                    if ext in (".exe", ".msi", ".bat", ".cmd"):
+                        self._open_executable(arg)
+                        return 0
+                elif arg.startswith("file://"):
+                    file_path = unquote(arg[7:])
+                    if os.path.isfile(file_path):
+                        self._open_executable(file_path)
+                        return 0
+
         if option := options.lookup_value("output-script"):
             searchstring = option.get_string()
             export_script_game = (
@@ -647,9 +686,74 @@ class LutrisApplication(Gtk.Application):
             return 0
 
         url = options.lookup_value(GLib.OPTION_REMAINING)
+        if url and not options.contains("install"):
+            args = url.get_strv()
+            if args:
+                if len(args) > 1 and self._is_uri(args[0]):
+                    reconstructed = args[0]
+                    start = 1
+                    for arg in args[start:]:
+                        if isinstance(arg, str):
+                            if arg.startswith("-"):
+                                break
+                            reconstructed += "&" + arg
+                            continue
+                        break
+                    self.activate()
+                    if self.window:
+                        self.window.present()
+                    self._open_uri(reconstructed)
+                    return 0
+                for arg in args:
+                    if self._is_uri(arg):
+                        self.activate()
+                        if self.window:
+                            self.window.present()
+                        self._open_uri(arg)
+                        return 0
+                if len(args) == 1:
+                    arg = args[0]
+                    try:
+                        filename = command_line.create_file_for_arg(arg).get_path()
+                    except Exception:
+                        filename = None
+                    if filename and filename.lower().endswith((".exe", ".msi", ".bat", ".cmd", ".reg")):
+                        if not os.path.isfile(filename):
+                            ErrorDialog(_("No such file: %s") % filename, parent=self.window)
+                            return 1
+                        self.activate()
+                        if self.window:
+                            self.window.present()
+                        self.show_window(RunExeDialog, filename=filename)
+                        return 0
         try:
             installer_info = self.get_lutris_action(url)
         except ValueError:
+            if url:
+                args = url.get_strv()
+                if args:
+                    if len(args) > 1 and self._is_uri(args[0]):
+                        reconstructed = args[0]
+                        start = 1
+                        for arg in args[start:]:
+                            if isinstance(arg, str):
+                                if arg.startswith("-"):
+                                    break
+                                reconstructed += "&" + arg
+                                continue
+                            break
+                        self.activate()
+                        if self.window:
+                            self.window.present()
+                        self._open_uri(reconstructed)
+                        return 0
+                    for arg in args:
+                        if self._is_uri(arg):
+                            self.activate()
+                            if self.window:
+                                self.window.present()
+                            self._open_uri(arg)
+                            return 0
             self._print(command_line, _("%s is not a valid URI") % (url.get_strv() if url else "''"))
             return 1
 
@@ -887,6 +991,51 @@ class LutrisApplication(Gtk.Application):
 
         return Game(game_id)
 
+    def run_executable(self, game_id: str, filename: str, is_uri: bool = False) -> bool:
+        """Open a Windows file under the game that owns its Wine prefix."""
+        if not os.path.isfile(filename) and not is_uri:
+            raise FileNotFoundError(_("No such file: %s") % filename)
+        game = Game(game_id)
+        if not game.is_installed or game.runner_name != "wine" or not game.config:
+            raise RuntimeError(_("The selected game is no longer available."))
+        prefix = cast("wine", game.runner).prefix_path
+        if not prefix:
+            raise RuntimeError(_("No Wine prefix could be found for the selected game."))
+        options = {"exe": filename, "args": "", "working_dir": os.path.dirname(filename) if not is_uri and os.path.dirname(filename) else None, "prefix": prefix}
+
+        for running in self.get_running_games():
+            if running.runner_name != "wine":
+                continue
+            running_prefix = cast("wine", running.runner).prefix_path
+            if not running_prefix or os.path.realpath(running_prefix) != os.path.realpath(prefix):
+                continue
+            if running.state == Game.STATE_LAUNCHING:
+                raise RuntimeError(_("This Wine prefix is still starting. Please try again once it has started."))
+
+            # Reuse the active prefix's runner settings without changing its game configuration.
+            game.config = deepcopy(running.config)
+            options["prefix"] = running_prefix
+            game.config.game_config.update(options)
+            gameplay_info = game.runner.play()
+            command, env = get_launch_parameters(game.runner, gameplay_info)
+            game.runner.finish_env(env, running)
+            process = MonitoredCommand(
+                command,
+                runner=game.runner,
+                env=env,
+                cwd=options.get("working_dir") or None,
+                log_buffer=running.log_buffer,
+            )
+            process.start()
+            if process.error:
+                raise RuntimeError(process.error)
+            if not hasattr(running, "additional_commands"):
+                running.additional_commands = []
+            running.additional_commands.append(process)
+            return True
+
+        return game.launch(LaunchUIDelegate(), game_config=options)
+
     @staticmethod
     def get_lutris_action(url: GLib.Variant | None) -> "InstallerInfoDict | dict[str, None]":
         installer_info = {
@@ -1111,13 +1260,39 @@ Also, check that the version specified is in the correct format.
         else:
             print(f"Runner '{runner_name}' cannot be uninstalled.")
 
-    def do_shutdown(self) -> None:  # pylint: disable=arguments-differ
-        logger.info("Shutting down Lutris")
+    def _is_uri(self, arg: str) -> bool:
+        if not isinstance(arg, str):
+            return False
+        if arg.startswith("file://"):
+            return False
+        if "://" in arg:
+            return True
+        # Handle schemes like magnet:, mailto:, etc. (scheme: followed by something)
+        if ":" in arg and not os.path.isabs(arg) and not arg.startswith(("/dev/", "~")):
+            # Check if it looks like a scheme (scheme part has no spaces/slashes typically)
+            scheme = arg.split(":", 1)[0]
+            if scheme and scheme.replace("-", "").replace("+", "").replace(".", "").isalnum() and len(scheme) > 1:
+                # Exclude Windows drive letters
+                if len(scheme) == 1:
+                    return False
+                return True
+        return False
+
+    def _open_executable(self, filename: str) -> None:
+        from lutris.gui.dialogs.run_exe import RunExeDialog
+
+        self.activate()
         if self.window:
-            selected_category = "%s:%s" % self.window.selected_category
-            settings.write_setting("selected_category", selected_category)
-            self.window.destroy()
-        Gtk.Application.do_shutdown(self)
+            self.window.present()
+        self.show_window(RunExeDialog, filename=filename)
+
+    def _open_uri(self, uri: str) -> None:
+        from lutris.gui.dialogs.run_exe import RunExeDialog
+
+        self.activate()
+        if self.window:
+            self.window.present()
+        self.show_window(RunExeDialog, filename=uri)
 
     def set_tray_icon(self) -> None:
         """Creates or destroys a tray icon for the application"""
